@@ -32,34 +32,17 @@ class RateModel(ABC):
         self.sim_res_type = 'final'
     
     @abstractmethod
-    def gain(self, mu: np.ndarray | float,
+    def gain(self,
+             mu: np.ndarray | float,
              pop_num: int | None = None
              ) -> np.ndarray | float:
         pass
-    
-    @abstractmethod
-    def gain_inv(self, r: np.ndarray | float,
-                 pop_num: int | None = None
-                 ) -> np.ndarray | float:
-        pass
-
-    @abstractmethod
-    def gain_deriv(self, mu: np.ndarray | float,
-                   pop_num: int | None = None
-                   ) -> np.ndarray | float:
-        pass
-    
-    @abstractmethod
-    def gain_inv_deriv(self, r: np.ndarray | float,
-                       pop_num: int | None = None
-                      ) -> np.ndarray | float:
-        pass
 
     def _run_full(self,
-            h: np.ndarray,   # input: (npops, 1 | nsteps)
+            h: np.ndarray,   # input: (npops, 1)
             r0: np.ndarray,   # initial state: (npops, 1)
-            dt: float,
-            nsteps: int
+            dt: float = 1,
+            nsteps: int = 10
             ) -> xr.DataArray:   # (npops, nsteps)
 
         # The result will be stored here
@@ -74,8 +57,7 @@ class RateModel(ABC):
         # Iterate to find the steady state
         for n in range(1, nsteps):
             r = R[:, [n - 1]]
-            h_ = h[:, [min(h.shape[1], n) - 1]]
-            r_hat = self.gain(self.W @ r + h_)
+            r_hat = self.gain(self.W @ r + h)
             R[:, [n]] = r + (r_hat - r) * dt / self.tau
         
         # Convert the result to xarray
@@ -87,10 +69,10 @@ class RateModel(ABC):
         return R
 
     def _run(self,
-            h: np.ndarray,   # input: (npops, 1 | nsteps)
+            h: np.ndarray,   # input: (npops, 1)
             r0: np.ndarray,   # initial state: (npops, 1)
-            dt: float,
-            nsteps: int
+            dt: float = 1,
+            nsteps: int = 10
             ) -> np.ndarray:   # (npops, 1)
         
         # Initial state
@@ -98,30 +80,20 @@ class RateModel(ABC):
 
         # Iterate to find the steady state
         for n in range(1, nsteps):
-            h_ = h[:, [min(h.shape[1], n) - 1]]
-            r_hat = self.gain(self.W @ r + h_)
+            r_hat = self.gain(self.W @ r + h)
             r += (r_hat - r) * dt / self.tau
         
         return r
     
     def run(self,
-            h: np.ndarray,   # input: (npops, 1 | nsteps)
+            h: np.ndarray,   # input: (npops, 1)
             r0: np.ndarray,   # initial state: (npops, 1)
             dt: float = 1,
-            nsteps: int | None = None
-            ) -> xr.DataArray | np.ndarray:   # (npops, 1 | nsteps)
-        
-        # Reshape if needed
+            nsteps: int = 10
+            ) -> xr.DataArray | np.ndarray:   # (npops | 1, nsteps)
+        # To column vectors
         r0 = r0.reshape((self.npops, 1))
-        if h.ndim == 1:
-            h = h.reshape((self.npops, 1))
-
-        if nsteps is None:
-            nsteps = h.shape[1]
-        else:
-            if (h.shape[1] > 1) and (h.shape[1] != nsteps):
-                raise ValueError(f"Expected h to have {nsteps} time steps, got {h.shape[1]}")
-
+        h = h.reshape((self.npops, 1))
         # Run (return full sim or the last bin only)
         if self.sim_res_type == 'full':
             return self._run_full(h, r0, dt, nsteps)
@@ -196,27 +168,7 @@ class RateModel(ABC):
             return self._run_1pop(pop_num, h, r0, dt, nsteps)
         else:
             raise ValueError(f"Unknown simulation result type: {self.sim_res_type}")
-    
-    def _reshape(self, x):
-        if np.squeeze(x).ndim == 1:
-            x = x.reshape((self.npops, 1))
-        return x
-    
-    def get_J(self, r, h):
-        r = self._reshape(r)
-        h = self._reshape(h)
-        d = self.gain_deriv(self.W @ r + h)   # (npops, 1)
-        return (self.W * d - np.eye(self.npops)) / self.tau
-    
-    def J_to_W(self, J, r):
-        r = self._reshape(r)
-        d_inv = self.gain_inv_deriv(r)   # (npops, 1)
-        return (J * self.tau + np.eye(self.npops)) * d_inv        
-    
-    def r0_to_h0(self, r0):
-        r0 = self._reshape(r0)
-        return self.gain_inv(r0) - self.W @ r0
-
+        
 
 class RateModelWC(RateModel):
 
@@ -236,46 +188,17 @@ class RateModelWC(RateModel):
         self.rmax = _to_array(rmax, (self.npops, 1))
         self.gain_slope = _to_array(gain_slope, (self.npops, 1))
         self.gain_center = _to_array(gain_center, (self.npops, 1))
-    
-    def _pepare_gain_vars(
-            self,
-            x: np.ndarray | float,   # mu or r, (npops x nsamples) or (1 x nsamples)
-            pop_num: int | None = None
-            ) -> tuple[float, float, float, float]:  # rmax, k, c, x
-        rmax, k, c  = self.rmax, self.gain_slope, self.gain_center
-        if pop_num is None:
-            x = x.reshape((self.npops, -1))
-        else:
-            if not np.isscalar(x):
-                x = x.reshape((1, -1))
-            rmax, k, c = rmax[pop_num, 0], k[pop_num, 0], c[pop_num, 0]
-        return rmax, k, c, x
 
     def gain(self,
              mu: np.ndarray | float,   # (npops x nsamples) or (1 x nsamples)
              pop_num: int | None = None
-             ) -> np.ndarray | float:   # r
-        rmax, k, c, mu = self._pepare_gain_vars(mu, pop_num)
-        return rmax / (1 + np.exp(-k * (mu - c)))
-    
-    def gain_inv(self,
-                 r: np.ndarray | float,   # (npops x nsamples) or (1 x nsamples)
-                 pop_num: int | None = None
-                 ) -> np.ndarray | float:   # mu
-        rmax, k, c, r = self._pepare_gain_vars(r, pop_num)
-        return c + (1 / k) * np.log(r / (rmax - r))
-    
-    def gain_deriv(self,
-                   mu: np.ndarray | float,   # (npops x nsamples) or (1 x nsamples)
-                   pop_num: int | None = None
-                   ) -> np.ndarray | float:   # dr/dmu
-        rmax, k, c, mu = self._pepare_gain_vars(mu, pop_num)
-        exp_term = np.exp(-k * (mu - c))
-        return (rmax * k * exp_term) / ((1 + exp_term) ** 2)
-    
-    def gain_inv_deriv(self,
-                       r: np.ndarray | float,   # (npops x nsamples) or (1 x nsamples)
-                       pop_num: int | None = None
-                       ) -> np.ndarray | float:   # dmu / dr
-        rmax, k, c, r = self._pepare_gain_vars(r, pop_num)
-        return 1 / (k * r * (1 - r / rmax))
+             ) -> np.ndarray | float:
+        rmax, k, c  = self.rmax, self.gain_slope, self.gain_center
+        if pop_num is None:
+            mu = mu.reshape((self.npops, -1))
+            return rmax / (1 + np.exp(-k * (mu - c)))
+        else:
+            if not np.isscalar(mu):
+                mu = mu.reshape((1, -1))
+            rmax, k, c = rmax[pop_num, 0], k[pop_num, 0], c[pop_num, 0]
+            return rmax / (1 + np.exp(-k * (mu - c)))    
